@@ -1,0 +1,130 @@
+#!/usr/bin/env bb
+;; hdiff — colored diff pager with chunk navigation
+;; usage: helmfile diff | bb scripts/hdiff
+;;        task deploy -- -e staging diff | scripts/hdiff
+
+(require '[clojure.string :as str]
+         '[babashka.process :as proc])
+
+;; ── colors ────────────────────────────────────────────────────────────────────
+
+(defn esc [c] (str "\033[" c "m"))
+(def RST (esc 0)) (def GRN (esc 32)) (def RED (esc 31))
+(def CYN (esc 36)) (def YLW (esc 33)) (def BLU (esc 34))
+(def BLD (esc 1))  (def REV (esc 7))
+
+(defn color-line [s]
+  (cond
+    (str/starts-with? s "Comparing") (str BLD YLW s RST)
+    (str/starts-with? s "@@")        (str CYN BLD s RST)
+    (str/starts-with? s "+++")       (str GRN BLD s RST)
+    (str/starts-with? s "---")       (str RED BLD s RST)
+    (str/starts-with? s "+")         (str GRN s RST)
+    (str/starts-with? s "-")         (str RED s RST)
+    (str/starts-with? s "Source:")   (str BLU s RST)
+    :else s))
+
+;; ── data ──────────────────────────────────────────────────────────────────────
+
+(def lines  (vec (line-seq (java.io.BufferedReader. *in*))))
+(def clines (mapv color-line lines))
+(def n      (count lines))
+
+(when (zero? n) (println "No input.") (System/exit 0))
+
+(defn chunk-line? [s]
+  (or (str/starts-with? s "Comparing")
+      (str/starts-with? s "@@")
+      (str/starts-with? s "+")
+      (str/starts-with? s "-")))
+
+;; Each contiguous block of matching lines registers once at its first line.
+(def chunks
+  (vec (:acc
+        (reduce (fn [{:keys [acc in-block]} [i s]]
+                  (let [m? (chunk-line? s)]
+                    (cond
+                      (and m? (not in-block)) {:acc (conj acc i) :in-block true}
+                      (not m?)                {:acc acc          :in-block false}
+                      :else                   {:acc acc          :in-block in-block})))
+                {:acc [] :in-block false}
+                (map-indexed vector lines)))))
+
+;; ── terminal ──────────────────────────────────────────────────────────────────
+
+(def tty (java.io.File. "/dev/tty"))
+
+(defn stty! [& args]
+  (proc/sh (into ["stty"] (map str args)) {:in tty :err :string}))
+
+(def saved-tty (str/trim (:out (stty! "-g"))))
+
+(defn restore! [] (stty! saved-tty) (print "\033[?1000l\033[2J\033[H") (flush))
+(.addShutdownHook (Runtime/getRuntime) (Thread. restore!))
+
+(stty! "raw" "-echo")
+(print "\033[?1000h") (flush) ; enable mouse wheel reporting
+
+(defn tsize []
+  (let [parts (->> (stty! "size") :out str/trim (re-seq #"\d+"))]
+    [(parse-long (first parts)) (parse-long (second parts))]))
+
+;; ── state + navigation ────────────────────────────────────────────────────────
+
+(def top (atom 0))
+
+(defn scroll! [d] (swap! top + d))
+
+(defn jump! [dir]
+  (when-let [p (case dir
+                 :next (first (filter #(> % @top) chunks))
+                 :prev (last  (filter #(< % @top) chunks)))]
+    (reset! top p)))
+
+;; ── render ────────────────────────────────────────────────────────────────────
+
+(defn render! []
+  (let [[h _] (tsize)
+        t     (max 0 (min @top (- n (max 1 (- h 1)))))
+        _     (reset! top t)
+        cn    (count (filter #(<= % t) chunks))
+        bar   (format " n/N:chunks  j/k/↑↓:scroll  spc/b:page  q:quit  [%d/%d  chunk %d/%d] "
+                      (inc t) n cn (count chunks))]
+    (print "\033[2J\033[H")
+    (run! #(print (str % "\r\n")) (subvec clines t (min n (+ t (- h 1)))))
+    (print (str RST REV bar RST))
+    (flush)))
+
+;; ── input loop ────────────────────────────────────────────────────────────────
+
+(def tty-in (java.io.FileInputStream. tty))
+(render!)
+(loop []
+  (let [c     (.read tty-in)
+        [h _] (tsize)]
+    (case c
+      113 (System/exit 0)                          ; q
+      110 (jump! :next)                            ; n
+      78  (jump! :prev)                            ; N
+      106 (scroll! 1)                              ; j
+      107 (scroll! -1)                             ; k
+      32  (scroll! (- h 2))                        ; space  page down
+      98  (scroll! (- 2 h))                        ; b      page up
+      27  (let [a (.read tty-in) b (.read tty-in)] ; ESC sequence
+            (when (= a 91)
+              (case b
+                65 (scroll! -1)                           ; ↑
+                66 (scroll! 1)                            ; ↓
+                53 (do (.read tty-in) (scroll! (- 2 h))) ; Page Up:   ESC [ 5 ~
+                54 (do (.read tty-in) (scroll! (- h 2))) ; Page Down: ESC [ 6 ~
+                77 (let [btn (.read tty-in)               ; mouse event: ESC [ M <btn> <x> <y>
+                         _x  (.read tty-in)
+                         _y  (.read tty-in)]
+                     (case (- btn 32)
+                       64 (scroll! -3)                    ; wheel up
+                       65 (scroll! 3)                     ; wheel down
+                       nil))
+                nil)))
+      nil)
+    (render!)
+    (recur)))
