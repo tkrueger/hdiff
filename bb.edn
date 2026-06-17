@@ -1,0 +1,1 @@
+{:bbin/bin {hdiff {:main-opts ["-f" "hdiff"]}}}
