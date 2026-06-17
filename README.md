@@ -44,7 +44,11 @@ kubectl diff -f manifest.yaml | hdiff
 
 ## Install
 
-<!-- TODO -->
+Using [bbin](https://github.com/babashka/bbin):
+
+```bash
+ bbin install io.github.tkrueger/hdiff
+```
 
 ## Requirements
 
